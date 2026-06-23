@@ -7,6 +7,8 @@ human possibly could — the classic signature of speed hacks and noclip.
 No dependencies beyond `ox_lib`. No client code. No performance cost worth measuring
 (one server thread that wakes once per second).
 
+![Security AC Logo](security-ac-logo.png)
+
 ---
 
 ## How it works
