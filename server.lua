@@ -1,20 +1,55 @@
--- Format: PlayerHistory[source] = { coords = vector3(x, y, z), timestamp = os.time(), rebaseline = true }
--- `rebaseline` = true means "the next big position jump for this player is an expected,
--- legitimate teleport (e.g. the spawn teleport to their last location). Absorb it once
--- instead of flagging it." It is set when the server confirms the player has spawned,
--- so it is immune to how long the client took to load.
+-- security_ac — server-side speed/teleport tripwire.
+--
+-- PlayerHistory[source] = {
+--   coords     = vector3,   -- last known position
+--   timestamp  = number,    -- GetGameTimer() ms at last sample (NOT os.time — see below)
+--   rebaseline = boolean,   -- next over-speed jump is an expected/legit teleport, absorb it once
+--   strikes    = number,    -- accumulated violations; kicks at CONFIG.KickThreshold
+-- }
 local PlayerHistory = {}
-local MAX_LEGAL_SPEED = 100.0 -- The maximum meters a player can legally travel in 1 second (roughly the speed of the fastest supercar)
 
--- Admins are exempt from speed tracking (they legitimately noclip / teleport for moderation).
--- IsPlayerAceAllowed is server-side and trustworthy — the same check qbx_core uses for admin gating.
-local EXEMPT_GROUPS = { 'god', 'admin', 'mod' }
+-- ============================ CONFIG (server-only) ============================
+-- This whole resource is server_scripts, so nothing here is readable by clients.
+local CONFIG = {
+    -- Max meters a player may legally travel per second on foot / in a ground
+    -- vehicle (~360 km/h — above the fastest supercar). Aircraft are exempted
+    -- separately because they routinely exceed this.
+    MaxLegalSpeed = 100.0,
+
+    -- How many strikes before a kick. Strikes accrue on each over-speed sample
+    -- and decay on each clean one, so transient spikes fade instead of booting.
+    KickThreshold = 3,
+
+    -- Strikes removed per clean (under-speed) sample.
+    StrikeDecay = 1,
+
+    -- ACE groups exempt from tracking (they noclip / teleport for moderation).
+    -- IsPlayerAceAllowed is server-side and trustworthy.
+    ExemptGroups = { 'god', 'admin', 'mod' },
+
+    -- Discord webhook for audit logging of kicks (and optionally warnings).
+    -- Leave '' to disable webhook logging (console print still happens).
+    DiscordWebhook = '',
+
+    -- Also send a Discord log on each individual strike (not just the final kick).
+    LogStrikes = false,
+}
+-- =============================================================================
 
 local function IsExempt(src)
-    for i = 1, #EXEMPT_GROUPS do
-        if IsPlayerAceAllowed(src --[[@as string]], EXEMPT_GROUPS[i]) then return true end
+    for i = 1, #CONFIG.ExemptGroups do
+        if IsPlayerAceAllowed(src --[[@as string]], CONFIG.ExemptGroups[i]) then return true end
     end
     return false
+end
+
+-- Aircraft legitimately exceed MaxLegalSpeed, so we skip players inside one.
+-- GetVehicleType is a server-side native returning a type string.
+local function IsInAircraft(ped)
+    local veh = GetVehiclePedIsIn(ped, false)
+    if veh == 0 then return false end
+    local vtype = GetVehicleType(veh)
+    return vtype == 'heli' or vtype == 'plane'
 end
 
 -- Mark a player so their next over-speed jump is treated as a legitimate teleport.
@@ -25,67 +60,111 @@ local function ForgiveNextTeleport(src)
     else
         PlayerHistory[src] = {
             coords = GetEntityCoords(GetPlayerPed(src)),
-            timestamp = os.time(),
-            rebaseline = true
+            timestamp = GetGameTimer(),
+            rebaseline = true,
+            strikes = 0,
         }
     end
 end
 
+-- Audit log: always print, optionally fire a Discord webhook embed.
+-- `colour` is a Discord embed decimal colour (red = 15158332, orange = 15105570).
+local function AuditLog(message, colour, force)
+    print(message)
+    if CONFIG.DiscordWebhook == '' then return end
+    if not force and not CONFIG.LogStrikes then return end
+    PerformHttpRequest(CONFIG.DiscordWebhook, function() end, 'POST', json.encode({
+        username = 'security_ac',
+        embeds = { {
+            title = 'Anti-Cheat',
+            description = message:gsub('%^%d', ''), -- strip console colour codes
+            color = colour,
+        } },
+    }), { ['Content-Type'] = 'application/json' })
+end
+
 CreateThread(function()
     while true do
-        Wait(1000) -- Every 1 Second
+        Wait(1000) -- sample every second
 
-        -- Loop through every player
         for _, playerId in ipairs(GetPlayers()) do
             local src = tonumber(playerId)
             local ped = GetPlayerPed(src)
 
-            -- Don't track players who haven't fully spawned yet (still in character
-            -- select / loading). qbx sets this once the player is actually in the world.
-            -- Admins are skipped entirely so they never flag and never accumulate history.
+            -- Only track fully-spawned, non-admin players that exist in the world.
             if DoesEntityExist(ped) and Player(src).state.isLoggedIn and not IsExempt(src) then
                 local currentCoords = GetEntityCoords(ped)
+                local hist = PlayerHistory[src]
 
-                -- Check if we have the history for the player
-                if PlayerHistory[src] then
-                    local lastCoords = PlayerHistory[src].coords
-                    local lastTime = PlayerHistory[src].timestamp
+                -- DEATH/RESPAWN: a dead ped is about to be teleported to the hospital
+                -- on respawn. Forgive that jump and rebaseline here, framework-agnostic
+                -- (no dependency on a specific death event firing server-side).
+                local isDead = GetEntityHealth(ped) <= 0
 
-                    local distance = #(currentCoords - lastCoords)
-                    local timeDelta = os.time() - lastTime
+                -- AIRCRAFT: legitimately faster than the ground speed cap — skip the
+                -- check but keep the baseline fresh so leaving the aircraft is clean.
+                local inAircraft = IsInAircraft(ped)
 
-                    -- Prevent division by zero if the loop runs too fast
-                    if timeDelta <= 0 then timeDelta = 1 end
-                    local velocity = distance / timeDelta
+                if not hist then
+                    -- First sighting: init and forgive the first jump (spawn teleport).
+                    PlayerHistory[src] = {
+                        coords = currentCoords,
+                        timestamp = GetGameTimer(),
+                        rebaseline = true,
+                        strikes = 0,
+                    }
+                elseif isDead or inAircraft then
+                    -- Absorb: just move the baseline forward, no velocity check.
+                    hist.coords = currentCoords
+                    hist.timestamp = GetGameTimer()
+                    if isDead then hist.rebaseline = true end
+                else
+                    local now = GetGameTimer()
+                    local distance = #(currentCoords - hist.coords)
+                    local timeDeltaMs = now - hist.timestamp
+                    if timeDeltaMs <= 0 then timeDeltaMs = 1 end       -- div-by-zero guard
+                    local velocity = distance / (timeDeltaMs / 1000.0) -- meters per second
 
-                    if velocity > MAX_LEGAL_SPEED then
-                        if PlayerHistory[src].rebaseline then
-                            -- Expected teleport (spawn / legal tp): absorb this one jump.
-                            PlayerHistory[src].rebaseline = false
+                    if velocity > CONFIG.MaxLegalSpeed then
+                        if hist.rebaseline then
+                            -- Expected teleport (spawn / legal tp): absorb one jump.
+                            hist.rebaseline = false
                         else
-                            print(('^1[SECURITY] Player %s (ID: %s) is going faster than the speed limit! (Speed: %s m/s)^0'):format(GetPlayerName(src), src, math.floor(velocity)))
+                            hist.strikes = hist.strikes + 1
+                            AuditLog(('^1[SECURITY] %s (ID: %s) over speed limit — %s m/s — strike %s/%s^0')
+                                :format(GetPlayerName(src), src, math.floor(velocity), hist.strikes, CONFIG.KickThreshold),
+                                15105570, false)
+
+                            if hist.strikes >= CONFIG.KickThreshold then
+                                AuditLog(('^1[SECURITY] %s (ID: %s) KICKED — sustained illegal speed (%s m/s)^0')
+                                    :format(GetPlayerName(src), src, math.floor(velocity)), 15158332, true)
+                                local player = exports.qbx_core:GetPlayer(src)
+                                if player then
+                                    player.Functions.Kick('[security_ac] Anormal hareket tespit edildi.')
+                                end
+                                PlayerHistory[src] = nil
+                            end
+                        end
+                    else
+                        -- Clean sample: decay accumulated strikes toward zero.
+                        if hist.strikes > 0 then
+                            hist.strikes = math.max(0, hist.strikes - CONFIG.StrikeDecay)
                         end
                     end
 
-                    -- Always update the baseline to the current position.
-                    PlayerHistory[src].coords = currentCoords
-                    PlayerHistory[src].timestamp = os.time()
-                else
-                    -- FIRST TIME SEEING PLAYER: initialise, and forgive their first jump
-                    -- (this catches the spawn teleport even if it lands before login state syncs).
-                    PlayerHistory[src] = {
-                        coords = currentCoords,
-                        timestamp = os.time(),
-                        rebaseline = true
-                    }
+                    -- Only update baseline if the entry still exists (a kick clears it).
+                    if PlayerHistory[src] then
+                        PlayerHistory[src].coords = currentCoords
+                        PlayerHistory[src].timestamp = now
+                    end
                 end
             end
         end
     end
 end)
 
--- Confirmed server-side spawn signal: the player has been teleported to their
--- chosen/last location. Forgive that one teleport, no matter how long loading took.
+-- Confirmed server-side spawn: player teleported to their chosen/last location.
+-- Forgive that one teleport no matter how long loading took.
 RegisterNetEvent('QBCore:Server:OnPlayerLoaded', function()
     ForgiveNextTeleport(source)
 end)
@@ -93,11 +172,11 @@ end)
 -- Public export: call before/after any legitimate teleport your scripts perform.
 exports('ResetGracePeriod', function(targetSrc)
     ForgiveNextTeleport(targetSrc)
-    print(('^3[INFO] Next teleport forgiven for Player %s (Legal Teleport)^0'):format(targetSrc))
+    print(('^3[INFO] Next teleport forgiven for Player %s (legal teleport)^0'):format(targetSrc))
 end)
 
--- Clean up memory when a user leaves the server
-AddEventHandler('playerDropped', function(reason)
+-- Free memory when a player leaves.
+AddEventHandler('playerDropped', function()
     local src = tonumber(source)
     PlayerHistory[src] = nil
 end)
